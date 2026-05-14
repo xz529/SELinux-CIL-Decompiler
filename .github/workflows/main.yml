@@ -1,1 +1,48 @@
+name: DumprX SEPolicy Fixer
 
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'URL репозитория с дампом'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Tools & Patch AssertionError
+        run: |
+          apt install m4
+          
+      - name: Clone Dump
+        run: git clone --depth 1 ${{ github.event.inputs.repo_url }} firmware_dump
+
+      - name: Decompile
+        run: |
+          mkdir -p output_te
+          # Поиск папки с селинкусом в дампе
+          SELINUX_PATH=$(find firmware_dump -type d -name "selinux" | grep "vendor" | head -n 1)
+          
+          if [ -z "$SELINUX_PATH" ]; then
+            echo "Path not found"
+            exit 1
+          fi
+          
+          python3 decompile_cil.py -s "$SELINUX_PATH" -o output_te
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed_sepolicy
+          path: output_te/
+          
