@@ -1,1 +1,1 @@
-# SELinux-CIL-Decompiler2
+# SELinux-CIL-Decompiler
