@@ -1,10 +1,10 @@
-name: DumprX SEPolicy Fixer
+name: DumprX SEPolicy
 
 on:
   workflow_dispatch:
     inputs:
       repo_url:
-        description: 'URL репозитория с дампом'
+        description: 'URL репозитория с дампом прошивки'
         required: true
 
 jobs:
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -20,29 +20,56 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Tools & Patch AssertionError
+      - name: Install System Dependencies
         run: |
-          apt install m4
-          
-      - name: Clone Dump
-        run: git clone --depth 1 ${{ github.event.inputs.repo_url }} firmware_dump
+          sudo apt-get update
+          sudo apt-get install -y m4 checkpolicy python3-pip
 
-      - name: Decompile
+      - name: Clone Firmware Dump
         run: |
+          echo "Клонирование дампа устройства..."
+          git clone --depth 1 ${{ github.event.inputs.repo_url }} firmware_dump
+
+      - name: Collect SELinux Files & Decompile
+        run: |
+          mkdir -p input_sepolicy
           mkdir -p output_te
-          # Поиск папки с селинкусом в дампе
-          SELINUX_PATH=$(find firmware_dump -type d -name "selinux" | grep "vendor" | head -n 1)
           
-          if [ -z "$SELINUX_PATH" ]; then
-            echo "Path not found"
+          echo "=== Поиск и сбор файлов SELinux из всех разделов ==="
+          
+          # Список стандартных мест и поиск по расширениям/именам (.cil, sepolicy, contexts)
+          # Ищем во всех ключевых директориях дампа (system, vendor, product, system_ext, odm)
+          find firmware_dump -type f \( -name "*.cil" -o -name "plat_sepolicy" -o -name "vendor_sepolicy" -o -name "precompiled_sepolicy" -o -name "*_contexts" \) | while read -r file; do
+            # Получаем относительный путь (например, system/etc/selinux/plat_sepolicy.cil)
+            rel_path=$(echo "$file" | sed 's|firmware_dump/||')
+            dir_name=$(dirname "$rel_path")
+            
+            # Воссоздаем структуру папок внутри input_sepolicy, чтобы скрипт понимал, откуда какой файл
+            mkdir -p "input_sepolicy/$dir_name"
+            cp "$file" "input_sepolicy/$dir_name/"
+            echo "Скопирован: $rel_path"
+          done
+
+          # Проверяем, нашлось ли хоть что-то
+          if [ -z "$(ls -A input_sepolicy)" ]; then
+            echo "::error::Файлы SELinux не найдены в дампе! Проверьте структуру разделов."
+            exit 1
+          fi
+
+          echo "=== Запуск декомпилятора ==="
+          # Поиск самого скрипта decompile_cil.py в текущем репозитории экшена
+          SCRIPT_PATH=$(find . -name "decompile_cil.py" | head -n 1)
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "::error::Скрипт decompile_cil.py не найден в репозитории экшена!"
             exit 1
           fi
           
-          python3 decompile_cil.py -s "$SELINUX_PATH" -o output_te
+          # Запуск декомпиляции из собранного со всех разделов слепка
+          python3 "$SCRIPT_PATH" -s input_sepolicy -o output_te
 
-      - name: Upload
+      - name: Upload Decompiled Policy Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fixed_sepolicy
+          name: decompiled_sepolicy_te
           path: output_te/
           
