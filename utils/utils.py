@@ -1,13 +1,15 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 import os
-from enum import Enum
+import re
+from contextlib import contextmanager
+from enum import StrEnum
 from os import path
 from subprocess import PIPE, run
-from typing import List, Optional, Set
+from typing import Generator, List, Optional, Set
 
 script_dir = path.dirname(path.realpath(__file__))
 android_root = path.realpath(path.join(script_dir, '..', '..', '..', '..'))
@@ -40,11 +42,18 @@ def get_dirs_with_file(dir_path: str, name: str):
         yield path.dirname(file_path)
 
 
-def run_cmd(cmd: List[str]):
+def run_cmd(cmd: List[str], capture: bool = True):
+    if capture:
+        stdout = PIPE
+        stderr = PIPE
+    else:
+        stdout = None
+        stderr = None
+
     proc = run(
         cmd,
-        stdout=PIPE,
-        stderr=PIPE,
+        stdout=stdout,
+        stderr=stderr,
         text=True,
         check=False,
     )
@@ -57,7 +66,7 @@ def run_cmd(cmd: List[str]):
     return proc.stdout
 
 
-class Color(str, Enum):
+class Color(StrEnum):
     RED = '\033[0;31m'
     GREEN = '\033[0;32m'
     YELLOW = '\033[1;33m'
@@ -78,6 +87,11 @@ def remove_comments(line: str):
     return line
 
 
+def squash_spaces(line: str):
+    line = line.lstrip()
+    return re.sub(r'[ \t]+', ' ', line)
+
+
 def is_empty_line(line: str):
     return not line.strip()
 
@@ -85,5 +99,18 @@ def is_empty_line(line: str):
 def split_normalize_text(text: str):
     lines = text.splitlines(keepends=True)
     lines = list(map(remove_comments, lines))
+    lines = list(map(squash_spaces, lines))
     lines = list(filter(lambda line: not is_empty_line(line), lines))
     return lines
+
+
+@contextmanager
+def WorkingDirectory(dir_path: str) -> Generator[None, None, None]:
+    cwd = os.getcwd()
+
+    os.chdir(dir_path)
+
+    try:
+        yield
+    finally:
+        os.chdir(cwd)
