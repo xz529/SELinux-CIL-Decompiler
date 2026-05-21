@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -24,11 +24,15 @@ from typing import (
 from sepolicy.classmap import Classmap
 from sepolicy.rule import Rule, flatten_parts, unpack_line
 from sepolicy.rules import split_rules
-from sepolicy.source_rule import SourceRule, format_ioctl_str, unpack_ioctls
+from sepolicy.source_rule import (
+    SourceRule,
+    format_ioctl_str,
+    unpack_ioctls,
+)
 from utils.utils import Color, color_print, split_normalize_text
 
 TARGET_FLAG_PREFIX = 'target_flag_'
-MACRO_START = 'define(`'
+MACRO_DEFINITION_START = 'define(`'
 BUILTIN_CALLS = set(['define', 'ifelse', 'eval', 'divert'])
 HANDLED_VARIABLE_MACRO_IFELSE = set(
     [
@@ -41,26 +45,13 @@ HANDLED_VARIABLE_MACRO_IFELSE = set(
 )
 
 
-def split_macros(lines: List[str]):
-    for block in split_rules(lines):
-        if not block.startswith(MACRO_START):
-            color_print(
-                f'Skipping non-macro block: {block}',
-                color=Color.YELLOW,
-            )
-            continue
-
-        assert block.endswith(')'), block
-        yield block
-
-
 def macro_name_body_raw(macro: str):
-    if not macro.startswith(MACRO_START):
+    if not macro.startswith(MACRO_DEFINITION_START):
         return None, macro
 
-    assert macro.startswith(MACRO_START), macro
+    assert macro.startswith(MACRO_DEFINITION_START), macro
     assert macro.endswith(')'), macro
-    macro = macro[len(MACRO_START) : -1]
+    macro = macro[len(MACRO_DEFINITION_START) : -1]
     name, body = macro.split("'", 1)
 
     assert body[0] == ',', body
@@ -106,15 +97,13 @@ ifelse_arg_variable_pattern = re.compile(
     r"\bifelse\s*\(\s*([^,\s\)]+)\s*,\s*`([^']*)'",
 )
 is_flag_enabled_regex = re.compile(
-    r'\bis_flag_enabled\s*\(\s*([^\s,)]+)',
+    r'\bis_flag_(?:enabled|disabled)\s*\(\s*([^\s,)]+)',
 )
 macro_call_pattern = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\(')
 macro_arity_pattern = re.compile(r'\$([1-9][0-9]*)')
 
 
 def macro_used_variables(name: Optional[str], body: str):
-    # TODO: handle is_flag_enabled
-    #
     # TODO: this only uses ifelse() statements to determine the used variables
     # but some variables might be used outside of that, like
     # starting_at_board_api(), which uses target_board_api_level inside an eval
@@ -267,6 +256,7 @@ def macro_names_used_variables(
 def expand_macro_bodies(
     macros: List[str],
     all_variables_choices: Dict[str, Set[str]],
+    macros_handled_elsewhere: Set[str],
 ):
     # Define macros used to change the quote format
     # This is used to add ` and ' around the expanded macro body
@@ -306,7 +296,7 @@ define(`quote_end', {quote_char("'")})
         used_macros = set(macro_used_macros(body))
 
         # Free-standing rules do not have a name but can use other macros
-        # TODO: check if non-macro rules have conditional variables?
+        # and variables
         used_variables: Set[str] = set()
         for match in variables_pattern.finditer(body):
             used_variables.add(match.group(1))
@@ -411,7 +401,7 @@ define(`quote_end', {quote_char("'")})
 
         dummy_call = ''
         # We do not need to produce defines() for rules, skip dummy calls
-        if not macro.is_rule:
+        if not macro.is_rule and macro.name not in macros_handled_elsewhere:
             assert macro.name is not None
             dummy_call = macro_dummy_call(macro.name, macro.arity)
             dummy_call += '\n'
@@ -435,6 +425,8 @@ define(`quote_end', {quote_char("'")})
             input_text += dummy_call
             input_text += '\n\n'
 
+    # TODO: fix
+    # m4:stdin:85771: bad expression in eval (excess input): 31.0 >= 202504
     output_text = subprocess.check_output(
         ['m4'],
         input=input_text,
@@ -457,12 +449,30 @@ def combine_variable_choices(
         yield dict(values)
 
 
+def split_ioctl_defines(expanded_ioctl_defines_text: str):
+    ioctl_defines: List[Tuple[str, str]] = []
+
+    for macro_text in split_rules(
+        split_normalize_text(expanded_ioctl_defines_text)
+    ):
+        name, body = macro_name_body(macro_text)
+        assert name is not None
+
+        # Compiled ioctls only keep the bottom two bytes
+        # Do the same here to get more matches
+        body = format_ioctl_str(body)
+        macro_tuple = (name, body)
+        ioctl_defines.append(macro_tuple)
+
+    return ioctl_defines
+
+
 def categorize_macros(expanded_macros_text: str):
     expanded_macros: List[Tuple[str, str]] = []
     class_sets: List[Tuple[str, str]] = []
     perms: List[Tuple[str, str]] = []
     ioctls: List[Tuple[str, str]] = []
-    ioctl_defines: List[Tuple[str, str]] = []
+    nlmsgs: List[Tuple[str, str]] = []
     rules: List[str] = []
 
     empty_macros: Set[str] = set()
@@ -481,34 +491,37 @@ def categorize_macros(expanded_macros_text: str):
             empty_macros.add(name)
             continue
 
-        # Compiled ioctls only keep the bottom two bytes
-        # Do the same here to get more matches
-        if body.startswith('0x'):
-            body = format_ioctl_str(body)
+        # Handled in format_ioctl_defines()
+        assert not body.startswith('0x'), macro_text
 
         macro_tuple = (name, body)
 
-        if body.startswith('0x'):
-            ioctl_defines.append(macro_tuple)
-        elif '_class_set' in name:
+        if '_class_set' in name:
             class_sets.append(macro_tuple)
         elif '_perms' in name:
             perms.append(macro_tuple)
         elif '_ioctls' in name:
             ioctls.append(macro_tuple)
+        elif '_nlmsgs' in name:
+            nlmsgs.append(macro_tuple)
         else:
             expanded_macros.append(macro_tuple)
 
-    return expanded_macros, class_sets, perms, ioctls, ioctl_defines, rules
+    return expanded_macros, class_sets, perms, ioctls, nlmsgs, rules
 
 
 # Extracted from system/sepolicy/build/soong/policy.go
+IOCTL_DEFINES_FILE = 'ioctl_defines'
+NLMSG_DEFINES_FILE = 'nlmsg_defines'
+
 SEPOLICY_FILES = [
     'global_macros',
     'neverallow_macros',
     'te_macros',
-    'ioctl_defines',
+    IOCTL_DEFINES_FILE,
     'ioctl_macros',
+    NLMSG_DEFINES_FILE,
+    'nlmsg_macros',
     'attributes',
 ]
 
@@ -520,55 +533,93 @@ SEPOLICY_FILES_PREFIXES = [
 
 
 def resolve_macro_paths(
-    macro_paths: List[str],
-    system_sepolicy_path: Optional[Path] = None,
+    macro_paths: List[Path],
+    system_sepolicy_path: Path,
+    verbose: bool,
 ):
-    macro_file_paths: List[str] = []
+    macro_file_paths: List[Path] = []
+    ioctl_defines_file_paths: List[Path] = []
+    nlmsg_defines_file_paths: List[Path] = []
     access_vectors_path: Optional[Path] = None
     flagging_macros_path: Optional[Path] = None
+    technical_debt_path: Optional[Path] = None
 
     # These do not exist per-version
-    if system_sepolicy_path is not None:
-        flagging_macros_path = Path(
-            system_sepolicy_path,
-            'flagging/flagging_macros',
-        )
-        if flagging_macros_path.is_file():
-            macro_file_paths.append(str(flagging_macros_path))
+    flagging_macros_path = Path(
+        system_sepolicy_path,
+        'flagging/flagging_macros',
+    )
+    if flagging_macros_path.is_file():
+        if verbose:
+            print(f'Loading flagging macros: {flagging_macros_path}')
+        macro_file_paths.append(flagging_macros_path)
+
+    def add_macro_path(mp: Path):
+        if mp.name == IOCTL_DEFINES_FILE:
+            ioctl_defines_file_paths.append(mp)
+        elif mp.name == NLMSG_DEFINES_FILE:
+            nlmsg_defines_file_paths.append(mp)
+        macro_file_paths.append(mp)
 
     for macro_path in macro_paths:
-        mp = Path(macro_path)
-        if mp.is_file():
-            macro_file_paths.append(str(mp.resolve()))
+        if macro_path.is_file():
+            if verbose:
+                print(f'Loading macros: {macro_path}')
+            add_macro_path(macro_path)
             continue
 
-        if not mp.is_dir():
+        if not macro_path.is_dir():
             color_print(
                 f'Macro path {macro_path} is not a file or directory',
                 color=Color.RED,
             )
             continue
 
-        for file_path in SEPOLICY_FILES:
-            for prefix in SEPOLICY_FILES_PREFIXES:
-                fp = Path(macro_path, prefix, file_path)
+        if verbose:
+            print(f'Loading macros from directory: {macro_path}')
 
-                if fp.is_file():
-                    macro_file_paths.append(str(fp.resolve()))
+        for file_name in SEPOLICY_FILES:
+            for file_prefix in SEPOLICY_FILES_PREFIXES:
+                file_path = Path(macro_path, file_prefix, file_name)
+                if not file_path.is_file():
+                    continue
 
-        fp = Path(macro_path, 'private/access_vectors')
-        if fp.is_file():
-            assert access_vectors_path is None
-            access_vectors_path = fp
+                if verbose:
+                    print(file_path.relative_to(macro_path))
+                add_macro_path(file_path)
 
-    return macro_file_paths, access_vectors_path, flagging_macros_path
+        file_path = Path(macro_path, 'private/access_vectors')
+        if file_path.is_file():
+            assert access_vectors_path is None, access_vectors_path
+            access_vectors_path = file_path
+            if verbose:
+                print(f'Loading access vectors: {access_vectors_path}')
+
+        file_path = Path(macro_path, 'private/technical_debt.cil')
+        if file_path.is_file():
+            assert technical_debt_path is None, technical_debt_path
+            technical_debt_path = file_path
+            if verbose:
+                print(f'Loading technical debt: {technical_debt_path}')
+
+    assert access_vectors_path is not None
+    assert flagging_macros_path is not None
+
+    return (
+        macro_file_paths,
+        ioctl_defines_file_paths,
+        nlmsg_defines_file_paths,
+        technical_debt_path,
+        access_vectors_path,
+        flagging_macros_path,
+    )
 
 
-def read_macros(macro_file_paths: List[str]) -> List[str]:
+def split_macros_text(macro_file_paths: List[Path]) -> List[str]:
     # Join all the macro files
     input_text = ''
     for macro_path in macro_file_paths:
-        input_text += Path(macro_path).read_text()
+        input_text += macro_path.read_text()
         input_text += '\n'
 
     # Split into lines, remove empty lines and commented lines
@@ -582,14 +633,15 @@ def read_macros(macro_file_paths: List[str]) -> List[str]:
     return macros_text
 
 
-def decompile_macros(
+def parse_macros(
     classmap: Classmap,
     expanded_macros: List[Tuple[str, str]],
 ):
     from_line_fn = partial(SourceRule.from_line, classmap=classmap)
 
     expanded_macro_rules: List[Tuple[str, List[Rule]]] = []
-    unqiue_macro_rules: Set[Tuple[str, FrozenSet[Rule]]] = set()
+    unqiue_macro_name_rules: Set[Tuple[str, FrozenSet[Rule]]] = set()
+    unique_macro_rules: Dict[FrozenSet[Rule], str] = {}
     invalid_macro_names: Set[str] = set()
     macro_names: Set[str] = set()
     for name, body in expanded_macros:
@@ -603,21 +655,36 @@ def decompile_macros(
                 invalid_macro_names.add(name)
             continue
 
-        hashable_macro_rule = (name, frozenset(rules))
-        if hashable_macro_rule in unqiue_macro_rules:
+        hashable_rules = frozenset(rules)
+        hashable_macro_name_rules = (name, hashable_rules)
+
+        if hashable_macro_name_rules in unqiue_macro_name_rules:
+            continue
+
+        # This is done to avoid the macros from being discard in favor of the
+        # other macro with the same name
+        # TODO: find better solution, although it's not really possible to
+        # distinguish between the two
+        if hashable_rules in unique_macro_rules:
+            duplicate_macro_name = unique_macro_rules[hashable_rules]
+            color_print(
+                f'Macro {name} has same rules as {duplicate_macro_name}',
+                color=Color.YELLOW,
+            )
             continue
 
         if name in macro_names:
             print(f'Macro {name} has multiple variants')
 
         expanded_macro_rules.append((name, rules))
-        unqiue_macro_rules.add(hashable_macro_rule)
+        unique_macro_rules[hashable_rules] = name
+        unqiue_macro_name_rules.add(hashable_macro_name_rules)
         macro_names.add(name)
 
     return expanded_macro_rules
 
 
-def decompile_perms(perms: List[Tuple[str, str]]):
+def parse_perms(perms: List[Tuple[str, str]]):
     decompiled_perms: List[Tuple[str, Set[str]]] = []
 
     for name, text in perms:
@@ -638,7 +705,15 @@ def decompile_perms(perms: List[Tuple[str, str]]):
     return decompiled_perms
 
 
-def decompile_ioctls(ioctls: List[Tuple[str, str]]):
+def ioctl_type_name(is_nlmsg: bool):
+    return 'nlmsg' if is_nlmsg else 'ioctl'
+
+
+def parse_ioctls(
+    ioctls: List[Tuple[str, str]],
+    is_nlmsg: bool,
+):
+    ioctl_type_name_cap = ioctl_type_name(is_nlmsg).capitalize()
     decompiled_ioctls: List[Tuple[str, Set[str]]] = []
 
     for name, text in ioctls:
@@ -655,7 +730,7 @@ def decompile_ioctls(ioctls: List[Tuple[str, str]]):
             unpacked_ioctls = list(unpack_ioctls(flattened_parts))
         except ValueError:
             color_print(
-                f'Ioctl macro {name} contains invalid ioctls: {text}',
+                f'{ioctl_type_name_cap} macro {name} contains invalid ioctls: {text}',
                 color=Color.RED,
             )
             continue
@@ -666,12 +741,17 @@ def decompile_ioctls(ioctls: List[Tuple[str, str]]):
     return decompiled_ioctls
 
 
-def decompile_ioctl_defines(ioctl_defines: List[Tuple[str, str]]):
+def parse_ioctl_defines(
+    ioctl_defines: List[Tuple[str, str]],
+    verbose: bool,
+    is_nlmsg: bool,
+):
+    ioctl_type_name_cap = ioctl_type_name(is_nlmsg).capitalize()
     decompiled_ioctl_defines: Dict[str, str] = {}
 
     duplicate_ioctls: Set[str] = set()
     for name, text in ioctl_defines:
-        value = hex(int(text, base=16))
+        value = hex(int(text, base=0))
         if value not in decompiled_ioctl_defines:
             decompiled_ioctl_defines[value] = name
             continue
@@ -683,10 +763,12 @@ def decompile_ioctl_defines(ioctl_defines: List[Tuple[str, str]]):
             continue
 
         existing_name = decompiled_ioctl_defines[value]
-        color_print(
-            f'Ioctl {name}={value} already defined as {existing_name}',
-            color=Color.YELLOW,
-        )
+        # This happens very often, but it's not exactly good
+        if verbose:
+            color_print(
+                f'{ioctl_type_name_cap} {name}={value} already defined as {existing_name}',
+                color=Color.YELLOW,
+            )
         duplicate_ioctls.add(value)
 
     return decompiled_ioctl_defines

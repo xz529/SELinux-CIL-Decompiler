@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 import re
-from enum import Enum
+from enum import StrEnum
 from typing import FrozenSet, Generator, List, Optional, Tuple, Union
 
 from sepolicy.class_set import ClassSet
@@ -36,8 +36,6 @@ def unpack_line(
     open_by_default: bool = False,
     ignored_chars: str = '',
 ) -> raw_parts_list:
-    # TODO: test ~{ a b } formatting for source rules
-
     stack: List[raw_parts_list] = []
     current: raw_parts_list = []
     token = ''
@@ -89,11 +87,12 @@ def flatten_parts(parts: raw_part) -> Generator[str, None, None]:
             yield part
 
 
-class RuleType(str, Enum):
+class RuleType(StrEnum):
     ALLOW = 'allow'
     ALLOWXPERM = 'allowxperm'
     ATTRIBUTE = 'attribute'
     AUDITALLOW = 'auditallow'
+    AUDITALLOWXPERM = 'auditallowxperm'
     DONTAUDIT = 'dontaudit'
     DONTAUDITXPERM = 'dontauditxperm'
     EXPANDATTRIBUTE = 'expandattribute'
@@ -115,11 +114,36 @@ ALLOW_RULE_TYPES = [
 
 IOCTL_RULE_TYPES = [
     RuleType.ALLOWXPERM,
+    RuleType.AUDITALLOWXPERM,
     RuleType.NEVERALLOWXPERM,
     RuleType.DONTAUDITXPERM,
 ]
 
 CLASS_SETS_RULE_TYPES = ALLOW_RULE_TYPES + IOCTL_RULE_TYPES
+CONTEXTS_LABEL_START = 'u:object_r:'
+CONTEXTS_LABEL_END = ':s0'
+
+
+def trim_contexts_label(t):
+    if not t or ":" not in t:
+        return t
+
+    parts = t.split(":")
+    
+    if "object_r" in parts:
+        idx = parts.index("object_r")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+            
+    if t.startswith("u:object_r:"):
+        t = t[11:]
+    elif t.startswith("u:"):
+        t = t[2:]
+        
+    if ":" in t:
+        t = t.split(":")[0]
+        
+    return t
 
 
 def join_varargs(varargs: Tuple[str, ...]):
@@ -148,22 +172,24 @@ def format_rule(rule: Rule):
             )
         case (
             RuleType.ALLOWXPERM
+            | RuleType.AUDITALLOWXPERM
             | RuleType.NEVERALLOWXPERM
             | RuleType.DONTAUDITXPERM
         ):
-            return '{} {} {}:{} ioctl {};'.format(
+            return '{} {} {}:{} {} {};'.format(
                 rule.rule_type,
                 rule.parts[0],
                 rule.parts[1],
                 rule.parts[2],
+                rule.parts[3],
                 join_varargs(rule.varargs),
             )
         case RuleType.TYPE:
             varargs = sorted(rule.varargs)
-            varargs_str = ', '.join(varargs)
-            return '{} {}, {};'.format(
-                rule.rule_type, rule.parts[0], varargs_str
-            )
+            assert isinstance(rule.parts[0], str)
+            parts = (rule.parts[0], *varargs)
+            parts_str = ', '.join(parts)
+            return '{} {};'.format(rule.rule_type, parts_str)
         case RuleType.TYPE_TRANSITION:
             assert len(rule.varargs) in [0, 1]
 
@@ -181,10 +207,13 @@ def format_rule(rule: Rule):
                 rule.parts[-1],
             )
         case RuleType.GENFSCON:
-            return 'genfscon {} {} u:object_r:{}:s0'.format(
+            return '{} {} {} {}{}{}'.format(
+                rule.rule_type,
                 rule.parts[0],
                 rule.parts[1],
+                CONTEXTS_LABEL_START,
                 rule.parts[2],
+                CONTEXTS_LABEL_END,
             )
         case (
             RuleType.ATTRIBUTE
@@ -237,6 +266,19 @@ class Rule:
         return self.__hash
 
 
+def rule_type_order(rule: Rule):
+    if rule.rule_type == RuleType.TYPE:
+        return -3
+    elif rule.rule_type == RuleType.ATTRIBUTE:
+        return -2
+    elif rule.rule_type == RuleType.TYPEATTRIBUTE:
+        return -1
+    elif rule.is_macro:
+        return 0
+    else:
+        return 1
+
+
 def rule_sort_key(rule: Rule):
     compare_values: List[Union[rule_part, Tuple[str, ...]]] = [
         rule.rule_type,
@@ -244,11 +286,4 @@ def rule_sort_key(rule: Rule):
         rule.varargs,
     ]
 
-    if rule.rule_type == RuleType.TYPE.value:
-        order = -1
-    elif rule.is_macro:
-        order = 0
-    else:
-        order = 1
-
-    return (order, *(str(h) for h in compare_values))
+    return (rule_type_order(rule), *(str(h) for h in compare_values))

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from utils.utils import split_normalize_text
 
 def extract_classmap(
     flagging_macros_path: Optional[Path],
-    access_vectors_path: Path,
     version: str,
+    access_vectors_path: Path,
 ) -> Dict[str, List[str]]:
     text = access_vectors_path.read_text()
 
@@ -82,13 +82,13 @@ class Classmap:
     def __init__(
         self,
         flagging_macros_path: Optional[Path],
-        access_vectors_path: Path,
         version: str,
+        access_vectors_path: Path,
     ):
         self.__class_perms_map = extract_classmap(
             flagging_macros_path,
-            access_vectors_path,
             version,
+            access_vectors_path,
         )
 
     def class_types(self, t: str):

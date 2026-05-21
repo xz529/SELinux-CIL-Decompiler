@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Dict, List, Optional, Set
 
 from sepolicy.conditional_type import ConditionalType, ConditionalTypeRedirect
@@ -160,8 +160,9 @@ def unpack_ioctls(parts: raw_parts_list):
             yield hex(n)
 
 
-class CilRuleType(str, Enum):
+class CilRuleType(StrEnum):
     ALLOWX = 'allowx'
+    AUDITALLOWX = 'auditallowx'
     NEVERALLOWX = 'neverallowx'
     DONTAUDITX = 'dontauditx'
     EXPANDTYPEATTRIBUTE = 'expandtypeattribute'
@@ -192,7 +193,6 @@ unknown_rule_types: Set[str] = set(
         'sidorder',
         'fsuse',
         'common',
-        'type',
         'typealias',
         'typealiasactual',
         'typepermissive',
@@ -283,6 +283,7 @@ class CilRule(Rule):
                 return [rule]
             case (
                 CilRuleType.ALLOWX.value
+                | CilRuleType.AUDITALLOWX.value
                 | CilRuleType.NEVERALLOWX.value
                 | CilRuleType.DONTAUDITX.value
             ):
@@ -293,7 +294,6 @@ class CilRule(Rule):
                 assert isinstance(parts[2], str), line
                 assert isinstance(parts[3], list), line
                 assert isinstance(parts[3][0], str), line
-                assert parts[3][0] == 'ioctl', line
                 assert isinstance(parts[3][1], str), line
                 assert isinstance(parts[3][2], list), line
 
@@ -310,6 +310,8 @@ class CilRule(Rule):
 
                 if parts[0] == CilRuleType.ALLOWX.value:
                     rule_type = RuleType.ALLOWXPERM.value
+                elif parts[0] == CilRuleType.AUDITALLOWX.value:
+                    rule_type = RuleType.AUDITALLOWXPERM.value
                 elif parts[0] == CilRuleType.NEVERALLOWX.value:
                     rule_type = RuleType.NEVERALLOWXPERM.value
                 elif parts[0] == CilRuleType.DONTAUDITX.value:
@@ -319,7 +321,7 @@ class CilRule(Rule):
 
                 rule = Rule(
                     rule_type,
-                    (src, dst, parts[3][1]),
+                    (src, dst, parts[3][1], parts[3][0]),
                     tuple(varargs),
                 )
                 return [rule]
@@ -328,7 +330,8 @@ class CilRule(Rule):
                 assert len(parts) == 2, line
                 assert isinstance(parts[1], str), line
 
-                # Remove generated typeattribute as it does not map to a source rule
+                # Remove generated typeattribute as they do not map to a source
+                # rule
                 if is_type_generated(parts[1]):
                     return []
 
@@ -388,6 +391,13 @@ class CilRule(Rule):
                 assert isinstance(parts[1], str), line
                 assert isinstance(parts[2], str), line
                 assert isinstance(parts[3][2], str), line
+                assert len(parts[2]) > 0, line
+
+                # Remove optional quotes
+                if parts[2][0] == '"':
+                    assert len(parts[2]) > 2, line
+                    assert parts[2][-1] == '"'
+                    parts[2] = parts[2][1:-1]
 
                 rule = Rule(
                     parts[0],
@@ -437,6 +447,16 @@ class CilRule(Rule):
                 rule = Rule(
                     RuleType.EXPANDATTRIBUTE.value,
                     (parts[1][0], parts[2]),
+                    (),
+                )
+                return [rule]
+            case RuleType.TYPE.value:
+                assert len(parts) == 2
+                assert isinstance(parts[1], str)
+
+                rule = Rule(
+                    parts[0],
+                    (parts[1],),
                     (),
                 )
                 return [rule]

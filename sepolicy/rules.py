@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -6,7 +6,7 @@ from __future__ import annotations
 from functools import partial
 from itertools import chain
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Set
 
 from sepolicy.classmap import Classmap
 from sepolicy.rule import Rule
@@ -21,18 +21,20 @@ ALLOWED_ROOT_SYSTEM_SEPOLICY_RULES_SUBDIRS = [
 
 
 def resolve_rule_paths(
-    rule_paths: List[str],
-    system_sepolicy_path: Optional[Path],
+    rule_paths: List[Path],
+    system_sepolicy_path: Path,
+    verbose: bool,
 ):
-    rule_file_paths: List[str] = []
+    rule_file_paths: List[Path] = []
 
     for rule_path in rule_paths:
-        rp = Path(rule_path)
-        if rp.is_file() and rp.suffix == '.te':
-            rule_file_paths.append(str(rp.resolve()))
+        if rule_path.is_file() and rule_path.suffix == '.te':
+            if verbose:
+                print(f'Loading rules: {rule_path}')
+            rule_file_paths.append(rule_path)
             continue
 
-        if not rp.is_dir():
+        if not rule_path.is_dir():
             color_print(
                 f'Rule path {rule_path} is not a file or directory',
                 color=Color.RED,
@@ -41,35 +43,40 @@ def resolve_rule_paths(
 
         # --current uses the root directory, which contains a lot of .te
         # files from other versions of the API too
-        if rp == system_sepolicy_path:
+        if rule_path == system_sepolicy_path:
             subdirs_to_scan = [
-                Path(rp, subdir_name)
+                Path(rule_path, subdir_name)
                 for subdir_name in ALLOWED_ROOT_SYSTEM_SEPOLICY_RULES_SUBDIRS
             ]
         else:
-            subdirs_to_scan = [rp]
+            subdirs_to_scan = [rule_path]
 
-        for subdir in subdirs_to_scan:
-            for file in subdir.rglob('*.te'):
-                if not file.is_file():
-                    color_print(
-                        f'Rule path {rule_path} is not a file',
-                        color=Color.YELLOW,
-                    )
+        for file_subdir in subdirs_to_scan:
+            if verbose:
+                print(f'Loading rules from directory: {file_subdir}')
+
+            for file_path in file_subdir.rglob('*.te'):
+                if not file_path.is_file():
                     continue
 
-                rule_file_paths.append(str(file.resolve()))
+                if verbose:
+                    print(file_path.relative_to(file_subdir))
+                rule_file_paths.append(file_path)
 
     return rule_file_paths
 
 
-def split_rules(lines: List[str]):
+def split_rules(
+    lines: List[str],
+    ending_char: str = ';',
+    only_end_at_ending_char: bool = False,
+):
     open_set = set(['{', '(', '`'])
     close_set = set(['}', ')', "'"])
     level = 0
     block = ''
 
-    last_c_macro_end = False
+    pending_macro_end = False
     for line in lines:
         assert '#' not in line
 
@@ -79,24 +86,25 @@ def split_rules(lines: List[str]):
             elif c in close_set:
                 level -= 1
 
-            # Previous macro ended with ) and this is not a ;, start a new block
-            if last_c_macro_end and c != ';':
-                last_c_macro_end = False
-                block = block.strip()
-                yield block
-                block = ''
+            # Previous macro ended with ) and this is not an ending char, start a new block
+            if pending_macro_end and c != ending_char:
+                pending_macro_end = False
+                if not only_end_at_ending_char:
+                    block = block.strip()
+                    yield block
+                    block = ''
 
             block += c
 
             is_macro_end = level == 0 and c == ')'
-            is_rule_end = level == 0 and c == ';'
+            is_rule_end = level == 0 and c == ending_char
 
             if is_macro_end:
-                last_c_macro_end = True
+                pending_macro_end = True
                 continue
 
             # Handle macro ending with );
-            if last_c_macro_end and c == ';':
+            if pending_macro_end and c == ending_char:
                 is_macro_end = True
 
             if is_macro_end or is_rule_end:
@@ -104,10 +112,15 @@ def split_rules(lines: List[str]):
                 yield block
                 block = ''
 
-    assert not block.strip()
+    if only_end_at_ending_char and block:
+        block = block.strip()
+        yield block
+        block = ''
+
+    assert not block.strip(), block
 
 
-def decompile_rules(classmap: Classmap, rules: List[str]):
+def parse_rules(classmap: Classmap, rules: List[str]):
     from_line_fn = partial(SourceRule.from_line, classmap=classmap)
     decompiled_rules: List[Rule] = []
     unique_rules: Set[Rule] = set()

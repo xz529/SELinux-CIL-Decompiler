@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from sepolicy.class_set import ClassSet
 from sepolicy.classmap import Classmap
 from sepolicy.conditional_type import ConditionalType
+from sepolicy.macro import ioctl_type_name
 from sepolicy.match_extract import (
     args_type,
     merge_arg_values,
@@ -32,7 +33,7 @@ class RuleMatch:
     def __init__(
         self,
         macro_name: str,
-        rules: Set[Rule] = set(),
+        rules: List[Rule] = [],
         arg_values: args_type = {},
     ):
         self.macro_name = macro_name
@@ -96,10 +97,20 @@ def rule_fill(rule: Rule, arg_values: args_type):
     return Rule(rule.rule_type, tuple(new_parts), rule.varargs)
 
 
+def rule_arity(rule: Rule):
+    macro_rule_args = rule_extract_part_iter(
+        rule.parts,
+        rule.parts,
+    )
+    assert macro_rule_args is not None
+    return len(macro_rule_args)
+
+
 def match_macro_rule(
     mld: MultiLevelDict[Rule],
     macro_rule: Rule,
-    rule_matches: Set[RuleMatch],
+    rule_matches: List[RuleMatch],
+    verbose: bool,
 ):
     print(f'Processing rule: {macro_rule}')
 
@@ -110,19 +121,29 @@ def match_macro_rule(
     assert macro_rule_args is not None
 
     # Check if this rule requires only already completed args
-    rule_match = next(iter(rule_matches))
-    is_match_keys_full = macro_rule_args.keys() <= rule_match.filled_args()
+    is_match_keys_full = macro_rule_args.keys() <= rule_matches[0].filled_args()
 
-    new_rule_matches: Set[RuleMatch] = set()
+    new_rule_matches: List[RuleMatch] = []
     for rule_match in rule_matches:
+        if verbose:
+            print(f'Processing rule match: {rule_match}')
+
         # TODO: make rule args extraction build a path that can be used for
         # filling no matter the args
         filled_rule = rule_fill(macro_rule, rule_match.arg_values)
+        if verbose:
+            print(f'Constructed filled rule: {filled_rule}')
         if filled_rule is None:
             continue
 
         match_keys = rule_match_keys(filled_rule, is_match_keys_full)
+        if verbose:
+            print(f'Constructed match keys: {match_keys}')
+
         for matched_rule in mld.match(match_keys):
+            if verbose:
+                print(f'Found matching rule: {matched_rule}')
+
             if is_match_keys_full:
                 # If the rule is fully filled don't expand the args
                 new_args_values = {}
@@ -136,18 +157,30 @@ def match_macro_rule(
                 rule_match.arg_values,
                 new_args_values,
             )
+
+            if verbose:
+                print(f'Merging arg values: {rule_match.arg_values}')
+                print(f'with: {new_args_values}')
+                print(f'= {new_arg_values}')
+
             if new_arg_values is None:
+                if verbose:
+                    print('Arg values incompatible, skip')
                 continue
 
             new_rules = rule_match.rules.copy()
-            new_rules.add(matched_rule)
+            new_rules.append(matched_rule)
 
             new_rule_match = RuleMatch(
                 rule_match.macro_name,
                 new_rules,
                 new_arg_values,
             )
-            new_rule_matches.add(new_rule_match)
+            new_rule_matches.append(new_rule_match)
+
+    if not new_rule_matches:
+        if verbose:
+            print('No matched rules')
 
     return new_rule_matches
 
@@ -156,92 +189,192 @@ def match_macro_rules(
     mld: MultiLevelDict[Rule],
     macro_name: str,
     macro_rules: List[Rule],
-    all_rule_matches: Set[RuleMatch],
+    all_rule_matches: List[RuleMatch],
+    verbose: bool,
 ):
     print(f'Processing macro: {macro_name}')
+    if verbose:
+        for macro_rule in macro_rules:
+            print(macro_rule)
+        print()
 
-    rule_matches: Set[RuleMatch] = set([RuleMatch(macro_name)])
+    # Inside the macro, prefer rules with higher arity to help
+    # the arg matching algorithm
+    macro_rules.sort(key=rule_arity, reverse=True)
+
+    rule_matches: List[RuleMatch] = [RuleMatch(macro_name)]
     for macro_rule in macro_rules:
         new_rule_matches = match_macro_rule(
             mld,
             macro_rule,
             rule_matches,
+            verbose,
         )
         print(f'Found {len(new_rule_matches)} candidates')
+        if verbose:
+            for rule_match in new_rule_matches:
+                print(rule_match)
+            print()
         if not len(new_rule_matches):
             print()
             return
 
         rule_matches = new_rule_matches
 
-    all_rule_matches.update(rule_matches)
+    all_rule_matches.extend(rule_matches)
 
     print(f'Found {len(rule_matches)} macro calls')
+    if verbose:
+        for rule_match in rule_matches:
+            print(rule_match)
     print()
 
 
-def replace_macro_rules(
+def match_macros_rules(
     mld: MultiLevelDict[Rule],
-    all_rule_matches: Set[RuleMatch],
+    macros_name_rules: List[Tuple[str, List[Rule]]],
+    verbose: bool,
+):
+    rule_matches: List[RuleMatch] = []
+
+    for macro_name, macro_rules in macros_name_rules:
+        match_macro_rules(
+            mld,
+            macro_name,
+            macro_rules,
+            rule_matches,
+            verbose,
+        )
+
+    return rule_matches
+
+
+def discard_rule_matches(
+    all_rule_matches: List[RuleMatch],
+    verbose: bool,
 ):
     color_print(
         f'All macros: {len(all_rule_matches)}',
         color=Color.GREEN,
     )
 
-    rule_matches_map: Dict[Rule, Set[RuleMatch]] = {}
+    rule_matches_map: Dict[Rule, List[RuleMatch]] = {}
     for rule_match in all_rule_matches:
         for rule in rule_match.rules:
             if rule not in rule_matches_map:
-                rule_matches_map[rule] = set()
-            rule_matches_map[rule].add(rule_match)
+                rule_matches_map[rule] = []
+            rule_matches_map[rule].append(rule_match)
 
     discarded_rule_matches: Set[RuleMatch] = set()
 
+    if verbose:
+        for rule, rule_matches in rule_matches_map.items():
+            print(f'Rule matches for: {rule}')
+            for rule_match in rule_matches:
+                print(rule_match)
+            print()
+
     for rule_match in all_rule_matches:
-        candidate_supersets: Optional[Set[RuleMatch]] = None
+        if verbose:
+            print(f'Finding supersets for rule match: {rule_match}')
+
+        candidate_supersets: Optional[List[RuleMatch]] = None
 
         for rule in rule_match.rules:
             rule_matches = rule_matches_map[rule]
 
+            if verbose:
+                print(f'Found {len(rule_matches)} candidates for rule: {rule}')
+                for r in rule_matches:
+                    print(r)
+                print()
+
             if candidate_supersets is None:
-                candidate_supersets = set(rule_matches)
+                candidate_supersets = rule_matches
             else:
-                candidate_supersets = candidate_supersets & rule_matches
+                new_candidate_supersets: List[RuleMatch] = []
+                for r in rule_matches:
+                    if r in candidate_supersets:
+                        new_candidate_supersets.append(r)
+                candidate_supersets = new_candidate_supersets
 
         assert candidate_supersets is not None
 
         candidate_supersets.remove(rule_match)
 
+        if verbose:
+            print(f'Found {len(candidate_supersets)} candidates')
+            for candidate in candidate_supersets:
+                print(candidate)
+            print()
+
+        rules_set = set(rule_match.rules)
         for candidate in candidate_supersets:
-            if rule_match.rules > candidate.rules:
+            candidate_rules_set = set(candidate.rules)
+
+            if rules_set > candidate_rules_set:
                 continue
 
-            if rule_match.rules == candidate.rules and len(
+            if rules_set == candidate_rules_set and len(
                 rule_match.arg_values
             ) < len(candidate.arg_values):
                 continue
 
+            if verbose:
+                print(f'Discarding {rule_match}')
+                print(f'in favor of {candidate}')
+
             discarded_rule_matches.add(rule_match)
             break
+
+        if verbose:
+            print()
 
     color_print(
         f'Discarded subset macros: {len(discarded_rule_matches)}',
         color=Color.GREEN,
     )
 
-    for rule_match in discarded_rule_matches:
-        all_rule_matches.remove(rule_match)
+    new_rule_matches: List[RuleMatch] = []
+    for rule_match in all_rule_matches:
+        if rule_match not in discarded_rule_matches:
+            new_rule_matches.append(rule_match)
 
+    return new_rule_matches
+
+
+def replace_macro_rules(
+    mld: MultiLevelDict[Rule],
+    all_rule_matches: List[RuleMatch],
+    name: str,
+    verbose: bool,
+):
     removed_rules = 0
     double_removed_rules: Set[Rule] = set()
     for rule_match in all_rule_matches:
+        if verbose:
+            print(f'Removing rules for match: {rule_match}')
+        removed_any = False
         for rule in rule_match.rules:
             try:
                 mld.remove(rule.hash_values, rule)
+                removed_any = True
                 removed_rules += 1
+                if verbose:
+                    print(f'Removed rule: {rule}')
             except KeyError:
+                if verbose:
+                    print(f'Already removed rule: {rule}')
                 double_removed_rules.add(rule)
+
+        if not removed_any:
+            if verbose:
+                print(f'No rules left in macro: {rule_match}')
+                print()
+            continue
+
+        if verbose:
+            print()
 
         rule = rule_match.macro
         mld.add(rule.hash_values, rule)
@@ -253,21 +386,21 @@ def replace_macro_rules(
     #     )
 
     color_print(
-        f'Replaced {removed_rules} rules with {len(all_rule_matches)} macros',
+        f'Replaced {removed_rules} rules with {len(all_rule_matches)} macros in {name}',
         color=Color.GREEN,
     )
 
 
 def remove_rules_from_rule_matches(
-    all_rule_matches: Set[RuleMatch],
+    all_rule_matches: List[RuleMatch],
     source_rules: List[Rule],
-    source: str,
+    source_name: str,
 ):
     source_rules_set = set(source_rules)
 
     removed_rule_matches: Set[RuleMatch] = set()
-    added_rule_matches: Set[RuleMatch] = set()
     removed_rules_in_matches: Set[Rule] = set()
+    added_rule_matches: List[RuleMatch] = []
     for rule_match in all_rule_matches:
         removed_rules_in_match: Set[Rule] = set()
 
@@ -281,7 +414,11 @@ def remove_rules_from_rule_matches(
         removed_rule_matches.add(rule_match)
         removed_rules_in_matches.update(removed_rules_in_match)
 
-        new_rule_match_rules = rule_match.rules - removed_rules_in_match
+        new_rule_match_rules: List[Rule] = []
+        for rule in rule_match.rules:
+            if rule not in removed_rules_in_match:
+                new_rule_match_rules.append(rule)
+
         if not new_rule_match_rules:
             continue
 
@@ -290,25 +427,34 @@ def remove_rules_from_rule_matches(
             new_rule_match_rules,
             rule_match.arg_values,
         )
-        added_rule_matches.add(new_rule_match)
+        added_rule_matches.append(new_rule_match)
 
-    for rule_match in removed_rule_matches:
-        all_rule_matches.remove(rule_match)
+    new_rule_matches: List[RuleMatch] = []
+    for rule_match in all_rule_matches:
+        if rule_match not in removed_rule_matches:
+            new_rule_matches.append(rule_match)
 
     for rule_match in added_rule_matches:
-        all_rule_matches.add(rule_match)
+        new_rule_matches.append(rule_match)
 
     color_print(
-        f'Removed {len(removed_rule_matches)} {source} macros',
+        f'Removed {len(removed_rule_matches)} {source_name} macros',
         color=Color.GREEN,
     )
     color_print(
-        f'Removed {len(removed_rules_in_matches)} {source} rules from macros',
+        f'Removed {len(removed_rules_in_matches)} {source_name} rules from macros',
         color=Color.GREEN,
     )
 
+    return new_rule_matches
 
-def remove_rules(mld: MultiLevelDict[Rule], rules: List[Rule], source: str):
+
+def remove_rules(
+    mld: MultiLevelDict[Rule],
+    rules: List[Rule],
+    source: str,
+    name: str,
+):
     removed_rules = 0
     for rule in rules:
         try:
@@ -318,15 +464,33 @@ def remove_rules(mld: MultiLevelDict[Rule], rules: List[Rule], source: str):
             pass
 
     color_print(
-        f'Removed {removed_rules} {source} rules',
+        f'Removed {removed_rules} {source} rules in {name}',
         color=Color.GREEN,
     )
 
 
-def merge_typeattribute_rules(mld: MultiLevelDict[Rule]):
+def merge_typeattribute_rules(
+    mld: MultiLevelDict[Rule],
+    name: str,
+):
     types: Dict[str, Set[str]] = {}
 
     removed_rules: Set[Rule] = set()
+    match_keys: Tuple[Optional[rule_hash_value], ...] = (
+        RuleType.TYPE.value,
+        None,
+        frozenset(),
+    )
+
+    for rule in mld.match(match_keys):
+        t = rule.parts[0]
+        assert isinstance(t, str)
+
+        assert t not in types
+        types[t] = set()
+
+        removed_rules.add(rule)
+
     match_keys: Tuple[Optional[rule_hash_value], ...] = (
         RuleType.TYPEATTRIBUTE.value,
         None,
@@ -341,7 +505,8 @@ def merge_typeattribute_rules(mld: MultiLevelDict[Rule]):
         assert isinstance(v, str)
 
         if t not in types:
-            types[t] = set()
+            continue
+
         types[t].add(v)
 
         removed_rules.add(rule)
@@ -358,49 +523,65 @@ def merge_typeattribute_rules(mld: MultiLevelDict[Rule]):
         mld.add(new_rule.hash_values, new_rule)
 
     color_print(
-        f'Merged {len(removed_rules)} typeattributes into {len(types)} types',
+        f'Merged {len(removed_rules)} typeattributes into {len(types)} types in {name}',
         color=Color.GREEN,
     )
 
 
-def merge_ioctl_rules(mld: MultiLevelDict[Rule]):
-    rules_dict: Dict[Tuple[rule_part, ...], Set[Rule]] = {}
-    for rule_type in IOCTL_RULE_TYPES:
-        match_tuple = (rule_type.value, None, None, None, None)
-        for matched_rule in mld.match(match_tuple):
-            # Keep varargs out of the key
-            key = (matched_rule.rule_type, *matched_rule.parts)
-
-            if key not in rules_dict:
-                rules_dict[key] = set()
-
-            rules_dict[key].add(matched_rule)
-
+def merge_ioctl_rules(rules: List[Rule], name: str):
+    new_rules: List[Rule] = []
+    same_rules: List[Rule] = []
     removed_rules = 0
     added_rules = 0
-    for rules in rules_dict.values():
-        if len(rules) == 1:
+
+    def merge_same_rules():
+        nonlocal removed_rules
+        nonlocal added_rules
+
+        if not len(same_rules):
+            return
+
+        first_rule = same_rules[0]
+
+        if len(same_rules) == 1:
+            merged_rule = first_rule
+        else:
+            removed_rules += len(same_rules)
+            added_rules += 1
+            all_varargs = tuple(v for r in same_rules for v in r.varargs)
+            merged_rule = Rule(
+                first_rule.rule_type,
+                first_rule.parts,
+                all_varargs,
+            )
+
+        new_rules.append(merged_rule)
+        same_rules.clear()
+
+    for rule in rules:
+        if rule.rule_type not in IOCTL_RULE_TYPES:
+            merge_same_rules()
+            new_rules.append(rule)
             continue
 
-        merged_varargs: Set[str] = set()
-        for rule in rules:
-            mld.remove(rule.hash_values, rule)
-            merged_varargs.update(rule.varargs)
-            removed_rules += 1
+        first_rule = same_rules[0] if len(same_rules) else None
 
-        matched_rule = next(iter(rules))
-        new_rule = Rule(
-            matched_rule.rule_type,
-            matched_rule.parts,
-            tuple(sorted(merged_varargs)),
-        )
-        mld.add(new_rule.hash_values, new_rule)
-        added_rules += 1
+        if first_rule is not None and (
+            rule.rule_type != first_rule.rule_type
+            or rule.parts != first_rule.parts
+        ):
+            merge_same_rules()
+
+        same_rules.append(rule)
+
+    merge_same_rules()
 
     color_print(
-        f'Merged {removed_rules} rules into {added_rules} ioctl rules',
+        f'Merged {removed_rules} rules into {added_rules} ioctl rules for {name}',
         color=Color.GREEN,
     )
+
+    return new_rules
 
 
 def replace_perms_set(
@@ -460,6 +641,7 @@ def replace_perms(
     mld: MultiLevelDict[Rule],
     classmap: Classmap,
     all_perms: List[Tuple[str, Set[str]]],
+    name: str,
 ):
     file_classes = list(classmap.class_types('file'))
     dir_classes = list(classmap.class_types('dir'))
@@ -470,15 +652,15 @@ def replace_perms(
     socket_perms: List[Tuple[str, Set[str]]] = []
 
     for perm in all_perms:
-        name = perm[0]
+        perm_name = perm[0]
 
-        if '_file_' in name:
+        if '_file_' in perm_name:
             file_perms.append(perm)
-        elif '_dir_' in name:
+        elif '_dir_' in perm_name:
             dir_perms.append(perm)
-        elif '_socket_' in name:
+        elif '_socket_' in perm_name:
             socket_perms.append(perm)
-        elif '_ipc_' in name:
+        elif '_ipc_' in perm_name:
             # _ipc_ perms are unused, don't bother
             continue
         else:
@@ -511,7 +693,7 @@ def replace_perms(
         mld.add(rule.hash_values, rule)
 
     color_print(
-        f'Replaced perm macros in {len(removed_rules)} rules',
+        f'Replaced perm macros in {len(removed_rules)} rules in {name}',
         color=Color.GREEN,
     )
 
@@ -520,13 +702,25 @@ def replace_ioctls(
     mld: MultiLevelDict[Rule],
     ioctls: List[Tuple[str, Set[str]]],
     ioctl_defines: Dict[str, str],
+    name: str,
+    is_nlmsg: bool,
 ):
     removed_rules: Set[Rule] = set()
     added_rules: Set[Rule] = set()
 
     for rule_type in IOCTL_RULE_TYPES:
-        match_tuple = (rule_type.value, None, None, None, None)
+        match_tuple = (rule_type.value, None, None, None, None, None)
         for matched_rule in mld.match(match_tuple):
+            ioctl_rule_type = matched_rule.parts[3]
+            if ioctl_rule_type == 'ioctl':
+                if is_nlmsg:
+                    continue
+            elif ioctl_rule_type == 'nlmsg':
+                if not is_nlmsg:
+                    continue
+            else:
+                assert False, ioctl_rule_type
+
             rule_varargs_set = set(matched_rule.varargs)
 
             varargs_set = rule_varargs_set
@@ -563,8 +757,9 @@ def replace_ioctls(
     for rule in added_rules:
         mld.add(rule.hash_values, rule)
 
+    ioctl_type_name_str = ioctl_type_name(is_nlmsg)
     color_print(
-        f'Replaced ioctl macros in {len(removed_rules)} rules',
+        f'Replaced {ioctl_type_name_str} macros in {len(removed_rules)} rules in {name}',
         color=Color.GREEN,
     )
 
@@ -635,6 +830,7 @@ def merge_class_set_rule_type(
 def merge_class_sets(
     mld: MultiLevelDict[Rule],
     class_sets: List[Tuple[str, Set[str]]],
+    name: str,
 ):
     removed_rules = 0
     added_rules = 0
@@ -648,7 +844,7 @@ def merge_class_sets(
         added_rules += new_added_rules
 
     color_print(
-        f'Merged {removed_rules} rules into {added_rules} class set rules',
+        f'Merged {removed_rules} rules into {added_rules} class set rules in {name}',
         color=Color.GREEN,
     )
 
@@ -733,3 +929,109 @@ def merge_target_domains(mld: MultiLevelDict[Rule]):
         f'Merged {removed_rules} rules into {added_rules} with target domains',
         color=Color.GREEN,
     )
+
+
+def find_used_types(rules: List[Rule], used_types: Set[str]):
+    def handle_type(t: rule_part):
+        if isinstance(t, str):
+            used_types.add(t)
+        elif isinstance(t, ConditionalType):
+            for p in t.positive:
+                used_types.add(p)
+            for n in t.negative:
+                used_types.add(n)
+
+    for rule in rules:
+        match rule.rule_type:
+            case (
+                RuleType.ALLOW.value
+                | RuleType.NEVERALLOW.value
+                | RuleType.AUDITALLOW.value
+                | RuleType.DONTAUDIT.value
+                | RuleType.ALLOWXPERM.value
+                | RuleType.NEVERALLOWXPERM.value
+                | RuleType.AUDITALLOWXPERM
+                | RuleType.DONTAUDITXPERM.value
+                | RuleType.TYPE_TRANSITION.value
+            ):
+                handle_type(rule.parts[0])
+                handle_type(rule.parts[1])
+            case RuleType.GENFSCON.value:
+                handle_type(rule.parts[2])
+            case RuleType.TYPE | RuleType.TYPEATTRIBUTE:
+                # These are the unused rules we're trying to remove
+                pass
+            case RuleType.ATTRIBUTE | RuleType.EXPANDATTRIBUTE:
+                # TODO: figure out if these should be taken into account
+                pass
+            case _:
+                assert False, rule
+
+
+def _remove_unused_types(
+    mld: MultiLevelDict[Rule],
+    match_keys: Tuple[Optional[rule_hash_value], ...],
+    used_types: Set[str],
+):
+    removed_rules: Set[Rule] = set()
+    for rule in mld.match(match_keys):
+        t = rule.parts[0]
+        if t in used_types:
+            continue
+
+        removed_rules.add(rule)
+
+    for rule in removed_rules:
+        mld.remove(rule.hash_values, rule)
+
+    return len(removed_rules)
+
+
+def remove_unused_types(mld: MultiLevelDict[Rule], used_types: Set[str]):
+    removed_rules = _remove_unused_types(
+        mld,
+        (
+            RuleType.TYPEATTRIBUTE,
+            None,
+            None,
+            frozenset(),
+        ),
+        used_types,
+    )
+    removed_rules += _remove_unused_types(
+        mld,
+        (
+            RuleType.TYPE,
+            None,
+            # This only works before typeattributes are merged into types
+            frozenset(),
+        ),
+        used_types,
+    )
+
+    color_print(
+        f'Removed {removed_rules} unused types',
+        color=Color.GREEN,
+    )
+
+
+def find_public_rules(
+    mld: MultiLevelDict[Rule],
+    referencing_rules: List[Rule],
+    public_types: Set[str],
+):
+    public_rules: List[Rule] = []
+
+    for rule in referencing_rules:
+        for matched_rule in mld.match(rule.hash_values):
+            if rule.rule_type == RuleType.TYPEATTRIBUTE:
+                assert isinstance(rule.parts[0], str)
+                public_types.add(rule.parts[0])
+            public_rules.append(matched_rule)
+
+    color_print(
+        f'Found {len(public_rules)} public rules',
+        color=Color.GREEN,
+    )
+
+    return public_rules

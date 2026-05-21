@@ -1,83 +1,16 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 import re
-from functools import cache
+from functools import cache, partial
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
-from sepolicy.rule import Rule, RuleType, rule_sort_key
+from sepolicy.match import RuleMatch
+from sepolicy.rule import Rule, RuleType, rule_sort_key, rule_type_order
 from utils.mld import MultiLevelDict
-
-PROPERTY_CONTEXTS_NAME = 'property_contexts'
-FILE_CONTEXTS_NAME = 'file_contexts'
-HWSERVICE_CONTEXTS_NAME = 'hwservice_contexts'
-VNDSERVICE_CONTEXTS_NAME = 'vndservice_contexts'
-SERVICE_CONTEXTS_NAME = 'service_contexts'
-SEAPP_CONTEXTS_NAME = 'seapp_contexts'
-GENFS_CONTEXTS_NAME = 'genfs_contexts'
-
-
-def copy_contexts(input_path: str, output_path: str):
-    # TODO: align parts against eachother?
-
-    lines: List[str] = []
-    with open(input_path, 'r') as file:
-        for line in file.readlines():
-            line = line.strip()
-
-            if not line:
-                continue
-
-            if line.startswith('#'):
-                continue
-
-            line = re.sub(r'\s+', ' ', line)
-            lines.append(line)
-
-    lines.sort()
-
-    with open(output_path, 'w') as file:
-        for line in lines:
-            file.write(line)
-            file.write('\n')
-
-
-def output_contexts(
-    selinux_dir: Optional[str],
-    output_dir: str,
-    partition_name: Optional[str],
-):
-    if selinux_dir is None:
-        return
-
-    for name in [
-        PROPERTY_CONTEXTS_NAME,
-        FILE_CONTEXTS_NAME,
-        HWSERVICE_CONTEXTS_NAME,
-        VNDSERVICE_CONTEXTS_NAME,
-        SERVICE_CONTEXTS_NAME,
-        SEAPP_CONTEXTS_NAME,
-    ]:
-        input_path = Path(selinux_dir, name)
-        if not input_path.exists() and partition_name is not None:
-            input_path = Path(selinux_dir, f'{partition_name}_{name}')
-
-        if not input_path.exists():
-            continue
-
-        output_path = Path(output_dir, name)
-        copy_contexts(str(input_path), str(output_path))
-
-
-def output_genfs_contexts(genfs_rules: List[Rule], output_dir: str):
-    output_path = Path(output_dir, GENFS_CONTEXTS_NAME)
-    with open(output_path, 'w') as o:
-        for rule in genfs_rules:
-            o.write(str(rule))
-            o.write('\n')
 
 
 @cache
@@ -117,18 +50,18 @@ def domain_type(rule: Rule):
 def rule_simple_type_name(rule: Rule):
     if rule.rule_type == RuleType.TYPE.value:
         if 'dev_type' in rule.varargs:
-            return DEVICE_TYPE_RULES_NAME
+            return DEVICE_TYPE_RULES_NAME, False
         elif 'file_type' in rule.varargs or 'fs_type' in rule.varargs:
-            return FILE_TYPE_RULES_NAME
+            return FILE_TYPE_RULES_NAME, False
         elif isinstance(rule.parts[0], str):
             if rule.parts[0].endswith('_prop'):
-                return PROPERTY_RULES_NAME
+                return PROPERTY_RULES_NAME, False
             elif rule.parts[0].endswith('_hwservice'):
-                return HWSERVICE_TYPE_RULES_NAME
+                return HWSERVICE_TYPE_RULES_NAME, False
             elif rule.parts[0].endswith('_service'):
-                return SERVICE_TYPE_RULES_NAME
+                return SERVICE_TYPE_RULES_NAME, False
 
-        return None
+        return None, False
     elif rule.rule_type in set(
         [
             RuleType.ATTRIBUTE.value,
@@ -136,12 +69,12 @@ def rule_simple_type_name(rule: Rule):
             'hal_attribute',
         ]
     ):
-        return ATTRIBUTE_RULES_NAME
+        return ATTRIBUTE_RULES_NAME, True
     elif isinstance(rule.parts[0], str):
         if rule.parts[0].endswith('_prop'):
-            return PROPERTY_RULES_NAME
+            return PROPERTY_RULES_NAME, False
 
-    return None
+    return None, False
 
 
 def group_rules(mld: MultiLevelDict[Rule]):
@@ -161,31 +94,71 @@ def group_rules(mld: MultiLevelDict[Rule]):
         # If all rules of this group are simple, re-group them
         is_all_simple_type = True
         simple_type_names: List[Optional[str]] = []
+        force_in_simple_types: List[bool] = []
         for rule in rules:
-            simple_type_name = rule_simple_type_name(rule)
+            simple_type_name, force_in_simple_type = rule_simple_type_name(rule)
             simple_type_names.append(simple_type_name)
+            force_in_simple_types.append(force_in_simple_type)
 
             if simple_type_name is None:
                 is_all_simple_type = False
 
-        for new_name, rule in zip(simple_type_names, rules):
-            if is_all_simple_type:
+        for new_name, force_in_simple_type, rule in zip(
+            simple_type_names,
+            force_in_simple_types,
+            rules,
+        ):
+            group_name = name
+            if is_all_simple_type or force_in_simple_type:
                 assert new_name is not None
-                name = new_name
+                group_name = new_name
 
-            if name not in regrouped_rules:
-                regrouped_rules[name] = set()
+            if group_name not in regrouped_rules:
+                regrouped_rules[group_name] = set()
 
-            regrouped_rules[name].add(rule)
+            regrouped_rules[group_name].add(rule)
 
     return regrouped_rules
 
 
-def output_grouped_rules(grouped_rules: Dict[str, Set[Rule]], output_dir: str):
-    for name, rules in grouped_rules.items():
-        sorted_rules = sorted(rules, key=rule_sort_key)
+def rule_macro_sort_key(
+    rule_matches_dict: Dict[Rule, List[Rule]],
+    rule: Rule,
+):
+    key = rule_sort_key(rule)
 
-        output_path = Path(output_dir, name)
+    # TODO: improve this
+    if rule.is_macro:
+        for r in rule_matches_dict[rule]:
+            order = rule_type_order(r)
+            if order < 0:
+                key = (order, *key[1:])
+                break
+
+    return key
+
+
+def output_grouped_rules(
+    grouped_rules: Dict[str, Set[Rule]],
+    rule_matches: List[RuleMatch],
+    output_dir: Path,
+):
+    rule_matches_dict: Dict[Rule, List[Rule]] = {
+        rm.macro: rm.rules for rm in rule_matches
+    }
+
+    rule_macro_sort_key_fn = partial(
+        rule_macro_sort_key,
+        rule_matches_dict,
+    )
+
+    for name, rules in grouped_rules.items():
+        sorted_rules = sorted(
+            rules,
+            key=rule_macro_sort_key_fn,
+        )
+
+        output_path = output_dir / name
         with open(output_path, 'w') as o:
             last_type = None
             for rule in sorted_rules:

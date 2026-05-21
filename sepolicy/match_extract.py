@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -181,6 +181,7 @@ def rule_extract_part_set_str(mrp: List[str], rp: List[str]):
         return None
     elif num_arg_values == 1:
         return arg_values_list[0]
+
 
 def rule_extract_part_cond(mrp: IConditionalType, rp: rule_part):
     if not isinstance(rp, IConditionalType):

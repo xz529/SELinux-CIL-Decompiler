@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: 2025 The LineageOS Project
+# SPDX-FileCopyrightText: The LineageOS Project
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
 from itertools import product
-from typing import List, Set
+from typing import List, Optional, Set
 
 from sepolicy.classmap import Classmap
 from sepolicy.conditional_type import ConditionalType
@@ -14,6 +14,7 @@ from sepolicy.rule import (
     flatten_parts,
     raw_part,
     raw_parts_list,
+    trim_contexts_label,
     unpack_line,
 )
 
@@ -28,12 +29,18 @@ def format_ioctl(ioctl: int):
 
 
 def format_ioctl_str(ioctl_str: str):
-    return format_ioctl(int(ioctl_str, base=16))
+    return format_ioctl(int(ioctl_str, base=0))
 
 
 def unpack_ioctls(ioctls: List[str], negative_ioctls: bool = False):
     if negative_ioctls:
-        missing_ioctls = set(trim_ioctl(int(i, base=16)) for i in ioctls)
+        missing_ioctls = set()
+        for i in ioctls:
+            try:
+                missing_ioctls.add(trim_ioctl(int(i, base=0)))
+            except ValueError:
+                # Если в списке исключений попался текст от MediaTek, пропускаем его числовую обработку
+                continue
 
         # TODO: maybe do not expand ranges
         for n in range(0x0000, 0x10000):
@@ -46,16 +53,26 @@ def unpack_ioctls(ioctls: List[str], negative_ioctls: bool = False):
 
     for part in ioctls:
         if '-' not in part:
-            yield format_ioctl(int(part, base=16))
+            try:
+                yield format_ioctl(int(part, base=0))
+            except ValueError:
+                # ФИКС: Если MediaTek подсунул текст вместо числа (например, 'unpriv_route_socket_nlmsgs')
+                # отдаем его строкой, чтобы декомпилятор не падал
+                yield part
             continue
 
         parts = part.split('-', 1)
-        start_ioctl = int(parts[0], base=16)
-        end_ioctl = int(parts[1], base=16)
+        try:
+            start_ioctl = int(parts[0], base=0)
+            end_ioctl = int(parts[1], base=0)
 
-        # TODO: maybe do not expand ranges
-        for n in range(start_ioctl, end_ioctl + 1):
-            yield format_ioctl(n)
+            # TODO: maybe do not expand ranges
+            for n in range(start_ioctl, end_ioctl + 1):
+                yield format_ioctl(n)
+        except ValueError:
+            # На случай, если текстовый макрос умудрился попасть в диапазон через дефис
+            yield part
+
 
 
 # TODO: implement this properly by allowing macros to have conditional
@@ -84,10 +101,20 @@ def structure_conditional_types(parts: raw_part, all_negatives: bool = False):
 
     flat_parts = flatten_parts(parts)
 
+    negative_next_part = False
     for part in flat_parts:
         assert isinstance(part, str), parts
-        if part.startswith('-'):
+
+        # Squash dash into the following part for instances like this
+        # neverallow { a - b } e:f g;
+        if part == '-':
+            negative_next_part = True
+        elif part.startswith('-'):
+            assert not negative_next_part
             negatives.append(part[1:])
+        elif negative_next_part:
+            negatives.append(part)
+            negative_next_part = False
         else:
             assert part[0].isalpha() or part[0] == '$', parts
             positives.append(part)
@@ -113,7 +140,32 @@ unknown_rule_types: Set[str] = set(
 
 class SourceRule(Rule):
     @classmethod
-    def from_line(cls, line: str, classmap: Classmap) -> List[Rule]:
+    def genfscon_from_line(cls, line: str):
+        parts = unpack_line(
+            line,
+            '{',
+            '}',
+            ' ',
+            open_by_default=True,
+        )
+
+        assert len(parts) == 4, line
+        assert isinstance(parts[0], str), line
+        assert isinstance(parts[1], str), line
+        assert isinstance(parts[2], str), line
+        assert isinstance(parts[3], str), line
+        assert parts[0] == RuleType.GENFSCON, line
+
+        t = trim_contexts_label(parts[3])
+        rule = Rule(
+            parts[0],
+            (parts[1], parts[2], t),
+            (),
+        )
+        return rule
+
+    @classmethod
+    def from_line(cls, line: str, classmap: Optional[Classmap]) -> List[Rule]:
         parts = unpack_line(
             line,
             '{',
@@ -183,6 +235,7 @@ class SourceRule(Rule):
                 for src, dst, class_name in product(srcs, dsts, class_names):
                     class_varargs = varargs
                     if varargs == ['*'] or negative_varargs:
+                        assert classmap is not None
                         class_varargs = classmap.class_perms(class_name)
 
                     if negative_varargs:
@@ -220,13 +273,10 @@ class SourceRule(Rule):
                     rules.append(rule)
             case (
                 RuleType.ALLOWXPERM.value
+                | RuleType.AUDITALLOWXPERM
                 | RuleType.NEVERALLOWXPERM.value
                 | RuleType.DONTAUDITXPERM.value
             ):
-                # TODO: ioctl rules are split at comments by the compiler
-                # and later merged as part of the final processing steps
-                # Try merging them ahead of time.
-
                 # neverallowxperm a b:c ioctl ~{ d };
                 negative_ioctls = False
                 if len(parts) > 6 and parts[5] == '~':
@@ -235,18 +285,18 @@ class SourceRule(Rule):
 
                 assert len(parts) == 6
                 assert isinstance(parts[4], str), line
-                assert parts[4] == 'ioctl'
 
                 srcs = structure_conditional_types(parts[1])
                 dsts = structure_conditional_types(parts[2])
                 class_names = flatten_parts(parts[3])
+                ioctl_or_nlmsg = parts[4]
                 varargs = list(flatten_parts(parts[5]))
                 ioctls = list(unpack_ioctls(varargs, negative_ioctls))
 
                 for src, dst, class_name in product(srcs, dsts, class_names):
                     rule = Rule(
                         parts[0],
-                        (src, dst, class_name),
+                        (src, dst, class_name, ioctl_or_nlmsg),
                         tuple(ioctls),
                     )
                     rules.append(rule)
@@ -274,6 +324,13 @@ class SourceRule(Rule):
                     rules.append(rule)
             case RuleType.TYPE.value:
                 assert isinstance(parts[1], str), line
+
+                rule = Rule(
+                    RuleType.TYPE.value,
+                    (parts[1],),
+                    (),
+                )
+                rules.append(rule)
 
                 # Convert type rules to typeattribute to allow easy matching
                 # with split typeattributeset rules
